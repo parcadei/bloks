@@ -1,14 +1,14 @@
 # bloks
 
-Context card generator — repo-first library knowledge for AI agents.
+Context blok generator — repo-first library knowledge for AI agents.
 
-bloks indexes libraries from npm, PyPI, crates.io, or local repos and generates structured context cards optimized for LLM consumption. It extracts APIs via [tldr](https://github.com/parcadei/tldr-code) AST analysis, scrapes documentation (including `llms.txt`), and serves it all through a progressive disclosure hierarchy: **deck → module → symbol**.
+bloks indexes libraries from npm, PyPI, crates.io, or local repos and generates structured context bloks optimized for LLM consumption. It extracts APIs via [tldr](https://github.com/parcadei/tldr-code) AST analysis, scrapes documentation (including `llms.txt`), and serves it all through a progressive disclosure hierarchy: **deck → module → symbol**.
 
 ## Install
 
 ```bash
 # Clone and build
-git clone git@github.com:parcadei/bloks.git
+git clone https://github.com/parcadei/bloks.git
 cd bloks
 cargo build --release
 
@@ -202,16 +202,17 @@ SEE ALSO
   Hono, text, use, type, req
 ```
 
-This is powered by two relation sources mined at index time:
+This is powered by three relation signals mined at index time:
 
-1. **Doc co-mention**: When two API symbols appear in the same documentation section, they get a bidirectional relation (strength 2).
-2. **Namespace proximity**: Symbols in the same module/package get weaker relations (strength 1).
+1. **Call graph** (strength 3): Caller/callee relationships from `tldr calls`, resolved to specific symbols via file-path matching and import scoping.
+2. **Doc co-mention** (strength 2): When two API symbols appear in the same documentation section.
+3. **Namespace proximity** (strength 1): Symbols in the same module/package.
 
-The top 5 related symbols (excluding those already shown) appear in the SEE ALSO section.
+The top 5 related symbols (by combined strength, excluding those already shown) appear in the SEE ALSO section.
 
 ## Project context
 
-Generate a context card for any project on disk:
+Generate a context blok for any project on disk:
 
 ```bash
 bloks context .                    # Current directory
@@ -256,25 +257,27 @@ bloks add <package>
   ├─ 3. Source analysis (tldr surface → API snippets with signatures)
   ├─ 4. Doc indexing (README, CLAUDE.md, AGENTS.md, docs/*.md → doc snippets)
   ├─ 5. Web docs scraping (llms.txt → sitemap.xml → HTML → text → chunks)
-  ├─ 6. Public API detection (entry-point re-exports mark visibility)
-  ├─ 7. Relation mining (doc co-mentions + namespace proximity → api_relations)
-  └─ 8. FTS5 indexing (snippets_fts for search)
+  ├─ 6. Call graph extraction (tldr calls → caller/callee edges)
+  ├─ 7. Per-file imports (tldr imports → import-scoped symbol resolution)
+  ├─ 8. Public API detection (entry-point re-exports mark visibility)
+  ├─ 9. Relation mining (call graph + doc co-mentions + namespace proximity)
+  └─ 10. FTS5 indexing (snippets_fts for search)
 ```
 
 ### Source files
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `main.rs` | 2700 | CLI, all commands, symbol card generation, relation mining |
-| `analyze.rs` | 940 | Source code analysis via tldr, public symbol detection |
-| `db.rs` | 760 | SQLite schema, CRUD, FTS5, card events, scoring |
-| `scrape.rs` | 670 | Web docs scraping (llms.txt, sitemap, HTML extraction) |
-| `block.rs` | 610 | Library/module card generation with progressive disclosure |
-| `cards.rs` | 450 | User card CRUD, parsing, lineage, FTS indexing |
-| `docs.rs` | 220 | Repo doc indexing (README, CLAUDE.md, test examples) |
-| `registry.rs` | 200 | npm/PyPI/crates.io package resolution |
-| `search.rs` | 100 | FTS5 search with library filtering |
-| `chunk.rs` | 60 | Markdown chunking by heading |
+| `main.rs` | ~3000 | CLI, all commands, symbol card generation, relation mining |
+| `analyze.rs` | ~1150 | Source analysis via tldr, call graph, imports, public symbol detection |
+| `db.rs` | ~760 | SQLite schema, CRUD, FTS5, card events, scoring |
+| `scrape.rs` | ~650 | Web docs scraping (llms.txt, sitemap, HTML extraction) |
+| `block.rs` | ~610 | Library/module card generation with progressive disclosure |
+| `cards.rs` | ~430 | User card CRUD, parsing, lineage, FTS indexing |
+| `docs.rs` | ~220 | Repo doc indexing (README, CLAUDE.md, test examples) |
+| `registry.rs` | ~200 | npm/PyPI/crates.io package resolution |
+| `search.rs` | ~100 | FTS5 search with library filtering |
+| `chunk.rs` | ~60 | Markdown chunking by heading |
 
 ## License
 

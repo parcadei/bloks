@@ -2,7 +2,7 @@
 name = "bloks"
 version = "0.1.0"
 edition = "2024"
-description = "Context block generator — repo-first library knowledge for AI agents"
+description = "Context blok generator — repo-first library knowledge for AI agents"
 license = "MIT"
 
 [[bin]]

@@ -29,7 +29,7 @@ pub(crate) enum CardLevel {
 }
 
 #[derive(Parser)]
-#[command(name = "bloks", version, about = "Context card generator — repo-first library knowledge for AI agents",
+#[command(name = "bloks", version, about = "Context blok generator — repo-first library knowledge for AI agents",
     after_help = "Shorthand:\n  bloks <lib>              Deck overview\n  bloks <lib> <symbol>     Symbol card\n  bloks <lib> <sym> --docs Include documentation")]
 struct Cli {
     #[command(subcommand)]
@@ -68,7 +68,7 @@ enum Commands {
         #[arg(long)]
         name: String,
     },
-    /// Generate a context card for a library (or a specific module/symbol)
+    /// Generate a context blok for a library (or a specific module/symbol)
     Card {
         /// Library name
         name: String,
@@ -141,7 +141,7 @@ enum Commands {
         /// Library name
         name: String,
     },
-    /// Report an error in a context card (self-tightening)
+    /// Report an error in a context blok (self-tightening)
     Report {
         /// Library name
         lib: String,
