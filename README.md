@@ -4,6 +4,8 @@ Context blok generator — repo-first library knowledge for AI agents.
 
 bloks indexes libraries from npm, PyPI, crates.io, or local repos and generates structured context bloks optimized for LLM consumption. It extracts APIs via [tldr](https://github.com/parcadei/tldr-code) AST analysis, scrapes documentation (including `llms.txt`), and serves it all through a progressive disclosure hierarchy: **deck → module → symbol**.
 
+Beyond libraries, bloks is a knowledge layer for anything an AI agent needs to remember. Use the card system to capture **design taste** (spacing, typography, color choices), **codebase-specific patterns** (how your team handles auth, state, errors), **component design rules** (always use compound components, never nest providers), and **architectural decisions** (why Drizzle over Prisma). Cards surface automatically alongside API context, so agents get your taste and constraints — not just docs.
+
 ## Install
 
 ```bash
