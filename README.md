@@ -7,17 +7,19 @@ bloks indexes libraries from npm, PyPI, crates.io, or local repos and generates 
 ## Install
 
 ```bash
-# Clone and build
-git clone https://github.com/parcadei/bloks.git
-cd bloks
-cargo build --release
+cargo install bloks
+```
 
-# Symlink to PATH
+Or build from source:
+
+```bash
+git clone https://github.com/parcadei/bloks.git
+cd bloks && cargo build --release
 ln -sf "$(pwd)/target/release/bloks" ~/.local/bin/bloks
 ```
 
 Requires:
-- Rust 2024 edition (1.85+)
+- Rust 1.85+ (2024 edition)
 - [tldr](https://github.com/parcadei/tldr-code) on PATH (for source code analysis)
 
 ## Quick start
