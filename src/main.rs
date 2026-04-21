@@ -29,7 +29,8 @@ pub(crate) enum CardLevel {
 }
 
 #[derive(Parser)]
-#[command(name = "bloks", version, about = "Context card generator — repo-first library knowledge for AI agents")]
+#[command(name = "bloks", version, about = "Context card generator — repo-first library knowledge for AI agents",
+    after_help = "Shorthand:\n  bloks <lib>              Deck overview\n  bloks <lib> <symbol>     Symbol card\n  bloks <lib> <sym> --docs Include documentation")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -228,6 +229,13 @@ enum Commands {
     },
     /// Rebuild search index from card files
     Reindex,
+    /// Index a specific URL into a library's docs (for agent-assisted discovery)
+    IndexUrl {
+        /// Library name
+        lib: String,
+        /// URL(s) to scrape and index
+        urls: Vec<String>,
+    },
     /// List user cards (optionally filtered by tag or kind)
     Cards {
         /// Filter by tag
@@ -303,17 +311,32 @@ async fn main() {
             Commands::Feedback { ack, nack } => cmd_feedback_split(&ack, &nack),
             Commands::Stats { lib, limit } => cmd_stats(lib.as_deref(), limit, fmt),
             Commands::Reindex => cmd_reindex(),
+            Commands::IndexUrl { lib, urls } => cmd_index_url(&lib, &urls).await,
             Commands::Cards { tag, kind, history } => cmd_cards(tag.as_deref(), kind.as_deref(), history.as_deref(), fmt),
         }
     } else if !cli.args.is_empty() {
         // Shorthand: `bloks react` → deck, `bloks react useState` → symbol card
-        let lib_name = &cli.args[0];
-        if cli.args.len() == 1 {
-            cmd_deck(lib_name, fmt)
+        // Filter out --format/--format=X from args (already parsed by clap into cli.format)
+        let filtered: Vec<&String> = {
+            let mut out = Vec::new();
+            let mut skip_next = false;
+            for arg in &cli.args {
+                if skip_next { skip_next = false; continue; }
+                if arg == "--format" { skip_next = true; continue; }
+                if arg.starts_with("--format=") { continue; }
+                out.push(arg);
+            }
+            out
+        };
+        if filtered.is_empty() {
+            cmd_list(fmt)
+        } else if filtered.len() == 1 {
+            cmd_deck(filtered[0], fmt)
         } else {
-            // Second arg could be a module or symbol — try symbol first, fall back to module
-            let query = &cli.args[1];
-            match parse_shorthand_level(&cli.args[2..]) {
+            let lib_name = filtered[0];
+            let query = filtered[1];
+            let rest: Vec<String> = filtered[2..].iter().map(|s| s.to_string()).collect();
+            match parse_shorthand_level(&rest) {
                 Ok(level) => {
                     let result = cmd_card(lib_name, None, Some(query), None, false, level, fmt).await;
                     if result.is_err() {
@@ -356,9 +379,9 @@ async fn add_one(name: &str, force: bool, registry: Option<&str>, docs_url_overr
     let meta = if let Some(reg) = registry {
         match reg {
             "npm" => registry::resolve_npm(name).await,
-            "pypi" => registry::resolve_pypi(name).await,
-            "crates" => registry::resolve_crates(name).await,
-            _ => return Err(format!("unknown registry: {reg}")),
+            "pypi" | "pip" => registry::resolve_pypi(name).await,
+            "crates" | "crates.io" | "crates-io" | "cargo" => registry::resolve_crates(name).await,
+            _ => return Err(format!("unknown registry: {reg}. Use: npm, pypi, crates")),
         }
     } else {
         registry::resolve_package(name).await
@@ -414,6 +437,9 @@ async fn add_one(name: &str, force: bool, registry: Option<&str>, docs_url_overr
         false
     };
 
+    let mut cg_edges = Vec::new();
+    let mut file_imports = std::collections::HashMap::new();
+
     if cloned {
         println!("\n[3/4] Analyzing...");
         let code = analyze::analyze_source_with_name(&clone_path, Some(name));
@@ -434,6 +460,16 @@ async fn add_one(name: &str, force: bool, registry: Option<&str>, docs_url_overr
             if let Some(ref url) = readme_docs_url {
                 println!("  Docs URL (from README): {url}");
             }
+        }
+
+        // Extract call graph edges and per-file imports before deleting clone
+        cg_edges = analyze::call_graph_edges(&clone_path);
+        if !cg_edges.is_empty() {
+            println!("  Call graph: {} edges", cg_edges.len());
+        }
+        file_imports = analyze::collect_file_imports(&clone_path);
+        if !file_imports.is_empty() {
+            println!("  File imports: {} files scanned", file_imports.len());
         }
 
         std::fs::remove_dir_all(&clone_path).ok();
@@ -482,7 +518,7 @@ async fn add_one(name: &str, force: bool, registry: Option<&str>, docs_url_overr
     println!("\n[4/4] Storing {} snippets...", all_snippets.len());
     db::store_snippets(&conn, &library_id, &all_snippets).map_err(|e| format!("store: {e}"))?;
     db::clear_api_relations(&conn, &library_id).map_err(|e| format!("relations: {e}"))?;
-    mine_api_relations(&conn, &library_id, name, &all_snippets).map_err(|e| format!("relations: {e}"))?;
+    mine_api_relations(&conn, &library_id, name, &all_snippets, &cg_edges, &file_imports).map_err(|e| format!("relations: {e}"))?;
     println!("  Done! '{name}' indexed with {} snippets", all_snippets.len());
     Ok(())
 }
@@ -512,7 +548,15 @@ async fn cmd_add_local(path: &std::path::Path, name: &str) -> Result<(), String>
 
     db::store_snippets(&conn, &library_id, &snippets).map_err(|e| format!("store: {e}"))?;
     db::clear_api_relations(&conn, &library_id).map_err(|e| format!("relations: {e}"))?;
-    mine_api_relations(&conn, &library_id, name, &snippets).map_err(|e| format!("relations: {e}"))?;
+    let cg_edges = analyze::call_graph_edges(&repo_path);
+    if !cg_edges.is_empty() {
+        println!("  Call graph: {} edges", cg_edges.len());
+    }
+    let file_imports = analyze::collect_file_imports(&repo_path);
+    if !file_imports.is_empty() {
+        println!("  File imports: {} files scanned", file_imports.len());
+    }
+    mine_api_relations(&conn, &library_id, name, &snippets, &cg_edges, &file_imports).map_err(|e| format!("relations: {e}"))?;
     println!("Indexed '{name}' with {} snippets", snippets.len());
     Ok(())
 }
@@ -1128,6 +1172,8 @@ fn mine_api_relations(
     library_id: &str,
     lib_name: &str,
     snippets: &[db::Snippet],
+    call_edges: &[analyze::CallEdge],
+    file_imports: &std::collections::HashMap<String, Vec<analyze::FileImport>>,
 ) -> Result<(), rusqlite::Error> {
     let api_symbols: Vec<(&db::Snippet, String, String)> = snippets.iter()
         .filter(|snippet| snippet.kind == "api")
@@ -1141,6 +1187,7 @@ fn mine_api_relations(
         })
         .collect();
 
+    // Signal 1: Doc co-mention (strength 2) — two API symbols mentioned in the same doc section
     for snippet in snippets.iter().filter(|snippet| snippet.kind == "doc") {
         let haystack = format!("{} {}", snippet.title.to_lowercase(), snippet.content.to_lowercase());
         let mut mentioned: Vec<String> = api_symbols.iter()
@@ -1158,6 +1205,7 @@ fn mine_api_relations(
         }
     }
 
+    // Signal 2: Namespace proximity (strength 1) — symbols in the same module
     let mut namespace_groups: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
     for (snippet, symbol, _) in &api_symbols {
         let module = block::snippet_module_name(snippet, lib_name);
@@ -1175,7 +1223,209 @@ fn mine_api_relations(
         }
     }
 
+    // Signal 3: Call graph (strength 3) — file-scoped matching using call edges + imports
+    //
+    // Two-tier matching replaces the old short-name-only approach:
+    //   Tier 1: Match by file path from call edge (dst_file → API symbols in that file)
+    //   Tier 2: Match by imported module (src_file imports module → API symbols from module)
+    //
+    // This eliminates the cartesian explosion from ambiguous names like "new" or "build".
+    if !call_edges.is_empty() {
+        // Index API symbols by file stem for Tier 1 (file-path matching)
+        // e.g., "async_impl/client" → [("Client.new", "src::async_impl::client::Client::new"), ...]
+        let mut api_by_file: std::collections::HashMap<String, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for (snippet, symbol, _) in &api_symbols {
+            let file_stem = snippet_file_stem(snippet);
+            if file_stem.is_empty() { continue; }
+            // Use title as the short match key — it's "Client.new" format
+            let title = snippet.title.clone();
+            api_by_file.entry(file_stem).or_default().push((title, symbol.clone()));
+        }
+
+        // Index API symbols by module path for Tier 2 (import-scoped matching)
+        // "error" → [("Error.new", "src::error::Error::new"), ...]
+        let mut api_by_module: std::collections::HashMap<String, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for (snippet, symbol, _) in &api_symbols {
+            let module = block::snippet_module_name(snippet, lib_name);
+            let title = snippet.title.clone();
+            api_by_module.entry(module.to_lowercase()).or_default().push((title, symbol.clone()));
+        }
+
+        let mut cg_relations = 0usize;
+        for edge in call_edges {
+            let src_file_stem = strip_source_ext(&edge.src_file);
+            let dst_file_stem = strip_source_ext(&edge.dst_file);
+            let src_func_short = edge.src_func.rsplit('.').next().unwrap_or(&edge.src_func).to_lowercase();
+            let dst_func_short = edge.dst_func.rsplit('.').next().unwrap_or(&edge.dst_func).to_lowercase();
+
+            // Tier 1: Match by file path — dst_file → API symbols in that file
+            let src_matches = match_by_file(&api_by_file, &src_file_stem, &edge.src_func, &src_func_short);
+            let dst_matches = match_by_file(&api_by_file, &dst_file_stem, &edge.dst_func, &dst_func_short);
+
+            if !src_matches.is_empty() && !dst_matches.is_empty() {
+                for src in &src_matches {
+                    for dst in &dst_matches {
+                        if src != dst {
+                            db::upsert_api_relation(conn, src, dst, library_id, 3, "call_graph")?;
+                            db::upsert_api_relation(conn, dst, src, library_id, 3, "call_graph")?;
+                            cg_relations += 1;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Tier 2: Import-scoped fallback — use the file's imports to find candidate modules
+            if src_matches.is_empty() || dst_matches.is_empty() {
+                let src_resolved = if src_matches.is_empty() {
+                    match_by_imports(file_imports, &api_by_module, &edge.src_file, &edge.src_func, &src_func_short)
+                } else {
+                    src_matches.clone()
+                };
+                let dst_resolved = if dst_matches.is_empty() {
+                    match_by_imports(file_imports, &api_by_module, &edge.dst_file, &edge.dst_func, &dst_func_short)
+                } else {
+                    dst_matches.clone()
+                };
+
+                for src in &src_resolved {
+                    for dst in &dst_resolved {
+                        if src != dst {
+                            db::upsert_api_relation(conn, src, dst, library_id, 3, "call_graph")?;
+                            db::upsert_api_relation(conn, dst, src, library_id, 3, "call_graph")?;
+                            cg_relations += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if cg_relations > 0 {
+            eprintln!("  Call graph relations: {cg_relations}");
+        }
+    }
+
     Ok(())
+}
+
+/// Extract file stem from a snippet's file_path (e.g., "async_impl/client.rs:93" → "async_impl/client")
+fn snippet_file_stem(snippet: &db::Snippet) -> String {
+    let fp = match &snippet.file_path {
+        Some(fp) => fp.as_str(),
+        None => return String::new(),
+    };
+    // Strip line number suffix (":93")
+    let path = fp.split(':').next().unwrap_or(fp);
+    strip_source_ext(path)
+}
+
+/// Strip source file extension: "async_impl/client.rs" → "async_impl/client"
+fn strip_source_ext(path: &str) -> String {
+    for ext in [".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".kt", ".rb", ".php"] {
+        if let Some(stem) = path.strip_suffix(ext) {
+            return stem.to_string();
+        }
+    }
+    path.to_string()
+}
+
+/// Tier 1: Match a function name against API symbols in a specific file.
+/// Returns full API symbol names that match.
+fn match_by_file(
+    api_by_file: &std::collections::HashMap<String, Vec<(String, String)>>,
+    file_stem: &str,
+    func_full: &str,   // e.g., "Client.execute_request"
+    func_short: &str,  // e.g., "execute_request" (lowercase)
+) -> Vec<String> {
+    let Some(symbols) = api_by_file.get(file_stem) else { return Vec::new() };
+
+    // Try exact title match first (e.g., "Client.new" == "Client.new")
+    let exact: Vec<String> = symbols.iter()
+        .filter(|(title, _)| title == func_full)
+        .map(|(_, full)| full.clone())
+        .collect();
+    if !exact.is_empty() { return exact; }
+
+    // Fall back to short-name match within this file only
+    symbols.iter()
+        .filter(|(title, _)| {
+            let title_short = title.rsplit('.').next().unwrap_or(title).to_lowercase();
+            title_short == func_short
+        })
+        .map(|(_, full)| full.clone())
+        .collect()
+}
+
+/// Tier 2: Use per-file import data to scope API symbol matching.
+/// Looks up what modules `src_file` imports, then finds API symbols in those modules.
+fn match_by_imports(
+    file_imports: &std::collections::HashMap<String, Vec<analyze::FileImport>>,
+    api_by_module: &std::collections::HashMap<String, Vec<(String, String)>>,
+    file_path: &str,
+    func_full: &str,
+    func_short: &str,
+) -> Vec<String> {
+    let file_key = strip_source_ext(file_path);
+    let Some(imports) = file_imports.get(file_path)
+        .or_else(|| file_imports.get(&file_key))
+    else { return Vec::new() };
+
+    let mut matches = Vec::new();
+    for imp in imports {
+        // Normalize import module to match api_by_module keys
+        // e.g., "crate::error" → "error", ".helpers" → "helpers", "super::request" → "request"
+        let module_key = normalize_import_module(&imp.module).to_lowercase();
+
+        // Check if the imported names include the function we're looking for
+        let name_imported = imp.names.iter().any(|n| n.to_lowercase() == func_short);
+
+        if let Some(symbols) = api_by_module.get(&module_key) {
+            if name_imported {
+                // Strong match: the name is explicitly imported from this module
+                matches.extend(
+                    symbols.iter()
+                        .filter(|(title, _)| {
+                            let t = title.rsplit('.').next().unwrap_or(title).to_lowercase();
+                            t == func_short
+                        })
+                        .map(|(_, full)| full.clone())
+                );
+            } else if imp.names.is_empty() {
+                // Wildcard/module import — match by short name within the module
+                matches.extend(
+                    symbols.iter()
+                        .filter(|(title, _)| {
+                            title == func_full || {
+                                let t = title.rsplit('.').next().unwrap_or(title).to_lowercase();
+                                t == func_short
+                            }
+                        })
+                        .map(|(_, full)| full.clone())
+                );
+            }
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
+/// Normalize import module paths to match snippet module names.
+/// "crate::error" → "error", "super::request" → "request", ".helpers" → "helpers"
+fn normalize_import_module(module: &str) -> String {
+    // Rust: strip crate:: or super:: prefix, take last segment
+    if let Some(rest) = module.strip_prefix("crate::") {
+        return rest.rsplit("::").next().unwrap_or(rest).to_string();
+    }
+    if let Some(rest) = module.strip_prefix("super::") {
+        return rest.rsplit("::").next().unwrap_or(rest).to_string();
+    }
+    // Python: strip leading dots (relative imports), take last segment
+    let stripped = module.trim_start_matches('.');
+    if stripped.is_empty() { return module.to_string(); }
+    // Take the last component: "flask.helpers" → "helpers", "werkzeug.datastructures" → "datastructures"
+    stripped.rsplit('.').next().unwrap_or(stripped).to_string()
 }
 
 fn collect_related_symbols(
@@ -2021,6 +2271,47 @@ fn find_similar_report_card(conn: &rusqlite::Connection, lib: &str, description:
                 .then_with(|| a.id.cmp(&b.id))
         })
         .map(|card| card.id)
+}
+
+async fn cmd_index_url(lib_name: &str, urls: &[String]) -> Result<(), String> {
+    let conn = db::init_db().map_err(|e| format!("db init: {e}"))?;
+    let lib = db::get_library(&conn, lib_name).map_err(|e| e.to_string())?
+        .ok_or_else(|| lib_not_found_err(&conn, lib_name))?;
+
+    let docs_url = if !lib.docs_url.is_empty() { &lib.docs_url }
+        else if !lib.homepage.is_empty() { &lib.homepage }
+        else { "" };
+
+    let mut total = 0usize;
+    for url in urls {
+        let new_snippets = scrape::scrape_one_page(url, docs_url).await;
+        if new_snippets.is_empty() {
+            eprintln!("  {url} — no content extracted");
+        } else {
+            println!("  {url} — {} snippets", new_snippets.len());
+            db::store_snippets(&conn, &lib.id, &new_snippets).map_err(|e| format!("store: {e}"))?;
+            total += new_snippets.len();
+        }
+    }
+
+    // Append new URLs to sitemap store so on-demand fetching can find them later
+    let mut existing: Vec<String> = lib.sitemap_urls.as_deref()
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+    for url in urls {
+        if !existing.contains(url) {
+            existing.push(url.clone());
+        }
+    }
+    let urls_json = serde_json::to_string(&existing).unwrap_or_default();
+    db::update_sitemap_urls(&conn, &lib.id, &urls_json).ok();
+
+    if total > 0 {
+        println!("Indexed {total} new snippets into '{lib_name}'");
+    } else {
+        println!("No content extracted from the provided URLs");
+    }
+    Ok(())
 }
 
 async fn cmd_refresh(stale_only: bool, name: Option<&str>) -> Result<(), String> {

@@ -2,13 +2,13 @@
 
 Context card generator — repo-first library knowledge for AI agents.
 
-bloks indexes libraries from npm, PyPI, crates.io, or local repos and generates structured context cards optimized for LLM consumption. It extracts APIs via [tldr](https://github.com/AugmentedCognitionLab/tldr) AST analysis, scrapes documentation (including `llms.txt`), and serves it all through a progressive disclosure hierarchy: **deck → module → symbol**.
+bloks indexes libraries from npm, PyPI, crates.io, or local repos and generates structured context cards optimized for LLM consumption. It extracts APIs via [tldr](https://github.com/parcadei/tldr-code) AST analysis, scrapes documentation (including `llms.txt`), and serves it all through a progressive disclosure hierarchy: **deck → module → symbol**.
 
 ## Install
 
 ```bash
 # Clone and build
-git clone git@github.com:cosimo-io/bloks.git
+git clone git@github.com:parcadei/bloks.git
 cd bloks
 cargo build --release
 
@@ -18,7 +18,7 @@ ln -sf "$(pwd)/target/release/bloks" ~/.local/bin/bloks
 
 Requires:
 - Rust 2024 edition (1.85+)
-- [tldr](https://github.com/AugmentedCognitionLab/tldr) on PATH (for source code analysis)
+- [tldr](https://github.com/parcadei/tldr-code) on PATH (for source code analysis)
 
 ## Quick start
 

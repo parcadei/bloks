@@ -1,5 +1,5 @@
 use crate::db::{self, Snippet};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -10,9 +10,13 @@ pub fn tldr_bin_path() -> String {
     if Path::new(&local).exists() { local } else { "tldr".to_string() }
 }
 
-/// Parse JSON from tldr output (skips status lines before JSON)
+/// Parse JSON from tldr output (skips status lines before JSON).
+/// Handles both object ({}) and array ([]) output — uses whichever bracket comes first.
 fn parse_json(stdout: &str) -> Option<serde_json::Value> {
-    let start = stdout.find('{').or_else(|| stdout.find('['))?;
+    let start = match (stdout.find('{'), stdout.find('[')) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }?;
     serde_json::from_str(&stdout[start..]).ok()
 }
 
@@ -26,6 +30,13 @@ pub fn analyze_source(repo: &Path) -> Vec<Snippet> {
 /// In monorepos, this ensures the main package is indexed before sibling packages.
 pub fn analyze_source_with_name(repo: &Path, lib_name: Option<&str>) -> Vec<Snippet> {
     let tldr = tldr_bin_path();
+
+    // Check if tldr is reachable
+    if Command::new(&tldr).arg("--version").output().is_err() {
+        eprintln!("  warning: tldr not found — install tldr-code for API extraction (cargo install tldr-code)");
+        return Vec::new();
+    }
+
     let mut source_dirs = find_source_dirs(repo);
 
     // Prioritize the directory matching the library name (e.g., drizzle-orm/src for "drizzle-orm")
@@ -94,6 +105,133 @@ pub fn analyze_source_with_name(repo: &Path, lib_name: Option<&str>) -> Vec<Snip
         }
     }
     all_snippets
+}
+
+/// Call graph edge from `tldr calls`, preserving file + function separately.
+#[derive(Debug, Clone)]
+pub struct CallEdge {
+    /// Relative file path (with extension): "async_impl/client.rs"
+    pub src_file: String,
+    /// Function name, often includes type: "Client.execute_request"
+    pub src_func: String,
+    /// Relative file path (with extension): "async_impl/request.rs"
+    pub dst_file: String,
+    /// Function name, often includes type: "Request.pieces"
+    pub dst_func: String,
+}
+
+/// Single import entry from `tldr imports`.
+#[derive(Debug, Clone)]
+pub struct FileImport {
+    pub module: String,
+    pub names: Vec<String>,
+}
+
+/// Run `tldr calls` on a repo and return parsed call graph edges.
+/// Returns empty vec on failure (tldr missing, unsupported language, etc).
+pub fn call_graph_edges(repo: &Path) -> Vec<CallEdge> {
+    let tldr = tldr_bin_path();
+    let mut all_edges = Vec::new();
+
+    for dir in &find_source_dirs(repo) {
+        let Ok(output) = Command::new(&tldr)
+            .args(["calls", "--format", "json", "--max-items", "500", &dir.to_string_lossy()])
+            .output()
+        else { continue };
+
+        if !output.status.success() { continue; }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let Some(data) = parse_json(&stdout) else { continue };
+
+        let Some(edges) = data.get("edges").and_then(|e| e.as_array()) else { continue };
+        for edge in edges {
+            let src_file = edge.get("src_file").and_then(|v| v.as_str()).unwrap_or("");
+            let src_func = edge.get("src_func").and_then(|v| v.as_str()).unwrap_or("");
+            let dst_file = edge.get("dst_file").and_then(|v| v.as_str()).unwrap_or("");
+            let dst_func = edge.get("dst_func").and_then(|v| v.as_str()).unwrap_or("");
+            if src_func.is_empty() || dst_func.is_empty() { continue; }
+            all_edges.push(CallEdge {
+                src_file: src_file.to_string(),
+                src_func: src_func.to_string(),
+                dst_file: dst_file.to_string(),
+                dst_func: dst_func.to_string(),
+            });
+        }
+    }
+
+    all_edges
+}
+
+/// Collect per-file imports for all source files in a repo.
+/// Returns map: relative_file_path → Vec<FileImport>.
+/// Uses `tldr imports <file> --format json` per file.
+pub fn collect_file_imports(repo: &Path) -> HashMap<String, Vec<FileImport>> {
+    let tldr = tldr_bin_path();
+    if Command::new(&tldr).arg("--version").output().is_err() {
+        return HashMap::new();
+    }
+
+    let mut result = HashMap::new();
+    let source_dirs = find_source_dirs(repo);
+    let extensions = ["rs", "py", "ts", "tsx", "js", "jsx", "go", "java", "kt", "rb", "php"];
+
+    for dir in &source_dirs {
+        collect_source_files_recursive(dir, &extensions, &mut |file_path| {
+            let Ok(output) = Command::new(&tldr)
+                .args(["imports", &file_path.to_string_lossy(), "--format", "json"])
+                .output()
+            else { return };
+
+            if !output.status.success() { return; }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let Some(data) = parse_json(&stdout) else { return };
+            let Some(arr) = data.as_array() else { return };
+
+            let imports: Vec<FileImport> = arr.iter().filter_map(|entry| {
+                let module = entry.get("module")?.as_str()?.to_string();
+                let names = entry.get("names")
+                    .and_then(|n| n.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                Some(FileImport { module, names })
+            }).collect();
+
+            if !imports.is_empty() {
+                // Store with relative path from repo root
+                let rel = file_path.strip_prefix(repo)
+                    .unwrap_or(file_path)
+                    .to_string_lossy()
+                    .to_string();
+                // Normalize: strip leading src/ if source_dir was repo/src
+                let rel = rel.strip_prefix("src/").unwrap_or(&rel).to_string();
+                result.insert(rel, imports);
+            }
+        });
+    }
+    result
+}
+
+/// Recursively walk a directory, calling `f` for each file matching the given extensions.
+fn collect_source_files_recursive(
+    dir: &Path,
+    extensions: &[&str],
+    f: &mut dyn FnMut(&Path),
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.') || name == "node_modules" || name == "target" || name == "vendor" {
+                continue;
+            }
+            collect_source_files_recursive(&path, extensions, f);
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if extensions.contains(&ext) {
+                f(&path);
+            }
+        }
+    }
 }
 
 /// Find source directories — handles monorepos and Rust workspaces
@@ -773,9 +911,78 @@ fn parse_js_exports_recursive(barrel_path: &Path, visited: &mut HashSet<std::pat
         }
     }
 
-    // Phase 2: Line-by-line for other export patterns
+    // Phase 1b: Multi-line CJS — module.exports = { ... } spanning multiple lines
+    {
+        let mut cjs_rest = content.as_str();
+        while let Some(start) = cjs_rest.find("module.exports") {
+            let after = &cjs_rest[start..];
+            if let Some(brace_pos) = after.find('{') {
+                let after_brace = &after[brace_pos + 1..];
+                if let Some(close) = after_brace.find('}') {
+                    let brace_content = &after_brace[..close];
+                    for item in brace_content.split(',') {
+                        let item = item.trim();
+                        if item.is_empty() { continue; }
+                        let name = item.split(':').next().unwrap_or(item).trim();
+                        if !name.is_empty() && name.chars().next().map_or(false, |c| c.is_alphabetic()) {
+                            exports.insert(name.to_string());
+                        }
+                    }
+                    cjs_rest = &after_brace[close + 1..];
+                } else {
+                    break;
+                }
+            } else {
+                cjs_rest = &cjs_rest[start + 14..]; // skip "module.exports"
+            }
+        }
+    }
+
+    // Phase 2: Line-by-line for other export patterns (ESM + CJS)
     for line in content.lines() {
         let trimmed = line.trim();
+
+        // CJS: module.exports = { X, Y, Z }
+        // CJS: module.exports = require('./router')
+        if trimmed.starts_with("module.exports") {
+            if let Some(brace_start) = trimmed.find('{') {
+                // module.exports = { X, Y, Z } — extract names
+                let rest = &trimmed[brace_start + 1..];
+                let brace_content = rest.split('}').next().unwrap_or("");
+                for item in brace_content.split(',') {
+                    let item = item.trim();
+                    if item.is_empty() { continue; }
+                    // "X: something" → take X; plain "X" → take X
+                    let name = item.split(':').next().unwrap_or(item).trim();
+                    if !name.is_empty() && name.chars().next().map_or(false, |c| c.is_alphabetic()) {
+                        exports.insert(name.to_string());
+                    }
+                }
+            } else if let Some(req_idx) = trimmed.find("require(") {
+                // module.exports = require('./router') — follow the require
+                let after = &trimmed[req_idx + 8..];
+                let req_path = after.trim_start_matches(|c| c == '\'' || c == '"')
+                    .split(|c: char| c == '\'' || c == '"' || c == ')')
+                    .next()
+                    .unwrap_or("");
+                if !req_path.is_empty() {
+                    if let Some(resolved) = resolve_js_import(barrel_path, req_path) {
+                        exports.extend(parse_js_exports_recursive(&resolved, visited, depth + 1));
+                    }
+                }
+            }
+        }
+
+        // CJS: exports.X = ...
+        if trimmed.starts_with("exports.") && trimmed.contains('=') {
+            let name = trimmed.strip_prefix("exports.").unwrap_or("")
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            if !name.is_empty() {
+                exports.insert(name.to_string());
+            }
+        }
 
         // export default X
         if trimmed.starts_with("export default ") {

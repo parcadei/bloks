@@ -226,27 +226,26 @@ pub fn find_module_urls(sitemap_json: &str, module: &str) -> Vec<String> {
 }
 
 /// Discover documentation pages to scrape.
-/// Tries: known patterns first (most reliable), then sitemap, then link crawl.
-async fn discover_pages(base: &str, lib_name: &str) -> Vec<String> {
-    // 1. Known patterns for popular sites (most reliable)
-    let known = known_patterns(base, lib_name);
-    if !known.is_empty() { return known; }
-
-    // 2. Try sitemap.xml
+/// Discover documentation pages. Tries sitemap first, then link crawl, plus hint seeds.
+async fn discover_pages(base: &str, _lib_name: &str) -> Vec<String> {
+    // 1. Try sitemap.xml (most complete when available)
     if let Some(pages) = try_sitemap(base).await
         && !pages.is_empty()
     {
         return pages;
     }
 
-    // 3. Try fetching the docs root and extracting links
-    if let Some(pages) = try_link_crawl(base).await
-        && !pages.is_empty()
-    {
-        return pages;
+    // 2. Link crawl — follow all same-domain links from the docs root
+    let mut pages = try_link_crawl(base).await.unwrap_or_default();
+
+    // 3. Merge in hint pages for sites where root doesn't link to docs
+    for hint in hint_pages(base) {
+        if !pages.contains(&hint) {
+            pages.push(hint);
+        }
     }
 
-    Vec::new()
+    pages
 }
 
 /// Parse sitemap.xml for documentation URLs (filter to /reference/, /api/, /docs/).
@@ -344,76 +343,52 @@ async fn try_link_crawl(base: &str) -> Option<Vec<String>> {
     if !resp.status().is_success() { return None; }
     let html = resp.text().await.ok()?;
 
+    let base_domain = base.split("://").nth(1).and_then(|s| s.split('/').next()).unwrap_or("");
+
     let mut urls = HashSet::new();
-    // Extract href values from <a> tags
     for chunk in html.split("href=\"").skip(1) {
         if let Some(end) = chunk.find('"') {
             let href = &chunk[..end];
+            // Skip fragments, javascript, mailto, empty
+            if href.is_empty() || href.starts_with('#') || href.starts_with("javascript:")
+                || href.starts_with("mailto:") { continue; }
             let full = if href.starts_with("http") {
                 href.to_string()
             } else if href.starts_with('/') {
-                // Parse base URL to get origin
                 let origin = base.split('/').take(3).collect::<Vec<_>>().join("/");
                 format!("{origin}{href}")
             } else {
                 format!("{base}/{href}")
             };
-            // Only keep same-domain links that look like docs/API pages
-            if full.starts_with(base) || (full.contains("://") && {
-                let base_domain = base.split("://").nth(1).and_then(|s| s.split('/').next()).unwrap_or("");
-                full.contains(base_domain)
-            }) {
-                let lower = full.to_lowercase();
-                if lower.contains("/reference/") || lower.contains("/api/")
-                    || lower.contains("/guide/") || lower.contains("/docs/")
-                    || lower.contains("/hook") || lower.contains("/component")
-                {
-                    urls.insert(full);
-                }
-            }
+            // Same-domain only
+            if !full.contains(base_domain) { continue; }
+            // Skip static assets
+            let lower = full.to_lowercase();
+            if lower.ends_with(".css") || lower.ends_with(".js") || lower.ends_with(".png")
+                || lower.ends_with(".jpg") || lower.ends_with(".svg") || lower.ends_with(".ico")
+                || lower.ends_with(".woff") || lower.ends_with(".woff2")
+                || lower.contains("/-/") || lower.contains("/static/")
+                || lower.contains("/assets/") { continue; }
+            urls.insert(full);
         }
     }
 
     if urls.is_empty() { return None; }
     let mut result: Vec<String> = urls.into_iter().collect();
     result.sort();
-    result.truncate(30);
+    result.truncate(50);
     Some(result)
 }
 
-/// Known URL patterns for popular documentation sites
-fn known_patterns(base: &str, _lib_name: &str) -> Vec<String> {
+/// Hint pages for sites where the root page doesn't link to docs directly.
+/// Returns seed URLs to try *in addition to* the generic link crawl.
+fn hint_pages(base: &str) -> Vec<String> {
     let lower = base.to_lowercase();
     let mut pages = Vec::new();
-
-    // react.dev
-    if lower.contains("react.dev") {
-        for hook in ["useState", "useEffect", "useContext", "useReducer",
-                     "useCallback", "useMemo", "useRef", "useId",
-                     "useDeferredValue", "useTransition", "useImperativeHandle",
-                     "useLayoutEffect", "useInsertionEffect", "useSyncExternalStore"] {
-            pages.push(format!("{base}/reference/react/{hook}"));
-        }
-        for comp in ["Fragment", "Profiler", "StrictMode", "Suspense"] {
-            pages.push(format!("{base}/reference/react/{comp}"));
-        }
-        for api in ["createContext", "forwardRef", "lazy", "memo", "cache", "use"] {
-            pages.push(format!("{base}/reference/react/{api}"));
-        }
-    }
-
-    // Sphinx-style docs (Flask, Click, Django, etc.)
-    if lower.contains("palletsprojects.com") || lower.contains("readthedocs") {
-        pages.push(format!("{base}/api/"));
-        pages.push(format!("{base}/quickstart/"));
-    }
-
-    // Express
+    // Sites where the landing page is marketing, not docs
     if lower.contains("expressjs.com") {
         pages.push(format!("{base}/en/5x/api.html"));
-        pages.push(format!("{base}/en/5x/guide/routing.html"));
     }
-
     pages
 }
 
@@ -649,6 +624,11 @@ fn docs_root(url: &str) -> String {
         if lower == "en" && segments.len() > 1 {
             return format!("{domain_part}/{}/{}", segments[0], segments[1]);
         }
+    }
+
+    // docs.rs: preserve crate name — "https://docs.rs/reqwest" stays as-is
+    if domain_part.contains("docs.rs") && !segments.is_empty() {
+        return format!("{domain_part}/{}", segments[0]);
     }
 
     // No docs prefix — use domain root

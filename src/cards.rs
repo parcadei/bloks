@@ -407,19 +407,6 @@ pub fn append_lineage(card_id: &str, date: &str, old_text: &str, new_text: &str)
     std::fs::write(&lineage_path, &content).ok();
 }
 
-/// Read lineage history for a card. Returns entries newest-first.
-pub fn read_lineage(card_id: &str) -> Vec<String> {
-    let dir = cards_dir();
-    let lineage_path = dir.join(format!("{card_id}.lineage"));
-    let Ok(content) = std::fs::read_to_string(&lineage_path) else { return Vec::new() };
-    let mut lines: Vec<String> = content.lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(String::from)
-        .collect();
-    lines.reverse();
-    lines
-}
-
 pub fn latest_in_chain(id: &str) -> Option<Card> {
     let cards = scan_all_cards();
     let mut latest = cards.iter().find(|card| card.id == id).cloned()?;
