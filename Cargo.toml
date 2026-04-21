@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Context blok generator — repo-first library knowledge for AI agents"
 license = "MIT"
+repository = "https://github.com/parcadei/bloks"
+homepage = "https://github.com/parcadei/bloks"
+keywords = ["ai", "llm", "context", "documentation", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
 
 [[bin]]
 name = "bloks"
